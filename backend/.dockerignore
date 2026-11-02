@@ -1,0 +1,7 @@
+# Never bake secrets or local data into the image.
+.env
+*.db
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.vscode/

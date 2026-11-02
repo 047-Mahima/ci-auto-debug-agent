@@ -3,14 +3,17 @@
 
 import hashlib
 import hmac
+import json
 
-from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, Header, HTTPException, Request
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db import get_db
 from app.models import Repository, WorkflowFailure, utc_now
+from app.pipeline import run_failure_pipeline_from_settings
+from app.pull_request import AUTO_FIX_BRANCH_PREFIX, record_pull_request_event
 from app.schemas import FailureListItem, GithubWebhookPayload, WebhookAck
 
 router = APIRouter(prefix="/api/github", tags=["github"])
@@ -86,6 +89,7 @@ def get_or_create_repository(db: Session, repo_payload: dict) -> Repository:
 @router.post("/webhook", response_model=WebhookAck)
 async def github_webhook(
     request: Request,
+    background_tasks: BackgroundTasks,
     payload: GithubWebhookPayload = Body(...),
     db: Session = Depends(get_db),
     x_github_event: str | None = Header(default=None, alias="X-GitHub-Event"),
@@ -103,6 +107,21 @@ async def github_webhook(
         return WebhookAck(
             accepted=True,
             message="GitHub webhook is reachable",
+        )
+
+    if event_name == "pull_request":
+        body = json.loads(raw_body)
+        pr = body.get("pull_request") or {}
+        recorded = record_pull_request_event(
+            db,
+            action=body.get("action"),
+            merged=bool(pr.get("merged")),
+            html_url=pr.get("html_url"),
+            head_ref=(pr.get("head") or {}).get("ref") or "",
+        )
+        return WebhookAck(
+            accepted=True,
+            message="Pull request outcome recorded" if recorded else "Pull request event ignored",
         )
 
     if event_name != "workflow_run":
@@ -162,6 +181,15 @@ async def github_webhook(
         }
         repo = get_or_create_repository(db, repo_payload)
 
+        # Runs on our own fix branches come from opening a draft PR. Analyzing them
+        # would open another PR, so they are never stored.
+        if (head_branch or "").startswith(AUTO_FIX_BRANCH_PREFIX):
+            db.commit()
+            return WebhookAck(
+                accepted=True,
+                message=f"Ignored run on auto-fix branch {head_branch}",
+            )
+
         if conclusion != "failure":
             db.commit()
             return WebhookAck(
@@ -204,6 +232,9 @@ async def github_webhook(
 
         db.commit()
         db.refresh(failure)
+
+        if settings.github_token:
+            background_tasks.add_task(run_failure_pipeline_from_settings, failure.id)
 
         return WebhookAck(
             accepted=True,

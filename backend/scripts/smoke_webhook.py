@@ -1,3 +1,6 @@
+# Manual smoke test: posts app/payload.json to the webhook and prints what is stored.
+# Run from backend/ with: PYTHONPATH=. python scripts/smoke_webhook.py
+# This writes to the real database. The pytest suite lives in tests/ instead.
 import json
 from pathlib import Path
 

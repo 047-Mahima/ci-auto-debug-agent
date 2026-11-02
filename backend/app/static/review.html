@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Failure review</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #ffffff; --text: #1d2330; --muted: #5b6475;
+    --line: #dde1e8; --ok: #1b7f3b; --bad: #b42318; --warn: #8a5a00; --accent: #2456c7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12151b; --card: #1a1e26; --text: #e6e9ef; --muted: #9aa3b2;
+      --line: #2c3340; --ok: #4cc773; --bad: #ff7b72; --warn: #e3b341; --accent: #7aa2ff;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #12151b; --card: #1a1e26; --text: #e6e9ef; --muted: #9aa3b2;
+    --line: #2c3340; --ok: #4cc773; --bad: #ff7b72; --warn: #e3b341; --accent: #7aa2ff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, sans-serif; }
+  header { padding: 16px; border-bottom: 1px solid var(--line); background: var(--card); }
+  header h1 { font-size: 18px; margin: 0 0 10px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  input, select, textarea, button { font: inherit; color: inherit; }
+  input, select, textarea { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px; }
+  input[type=password] { width: min(320px, 100%); }
+  main { padding: 16px; max-width: 900px; margin: 0 auto; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  .meta { color: var(--muted); font-size: 13px; }
+  .badge { display: inline-block; font-size: 12px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); margin-right: 4px; }
+  .status-PENDING_REVIEW { color: var(--warn); }
+  .status-APPROVED { color: var(--ok); }
+  .status-REJECTED { color: var(--bad); }
+  .status-PR_OPENED, .status-MERGED { color: var(--ok); }
+  .status-PR_CLOSED { color: var(--bad); }
+  .status-PR_OPENED { color: var(--accent); }
+  .label { font-weight: 600; margin-top: 12px; }
+  pre { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 10px; overflow-x: auto; font-size: 12px; max-height: 260px; white-space: pre-wrap; }
+  button { border: 1px solid var(--line); background: var(--bg); border-radius: 6px; padding: 8px 14px; cursor: pointer; }
+  button.approve { border-color: var(--ok); color: var(--ok); }
+  button.reject { border-color: var(--bad); color: var(--bad); }
+  button:disabled { opacity: .5; cursor: default; }
+  textarea { width: 100%; min-height: 56px; margin-top: 8px; }
+  .msg { margin: 8px 0 0; font-size: 13px; }
+  .empty { color: var(--muted); padding: 24px 0; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CI failure review</h1>
+  <div class="row">
+    <input id="key" type="password" placeholder="Review API key" autocomplete="off">
+    <input id="reviewer" placeholder="Your name" autocomplete="name">
+    <select id="status">
+      <option value="PENDING_REVIEW">Pending review</option>
+      <option value="APPROVED">Approved</option>
+      <option value="REJECTED">Rejected</option>
+      <option value="PR_OPENED">PR opened</option>
+      <option value="PR_OPENED">Draft PR opened</option>
+      <option value="MERGED">Merged</option>
+      <option value="PR_CLOSED">PR closed unmerged</option>
+      <option value="ERROR">Errors</option>
+    </select>
+    <button id="refresh">Refresh</button>
+  </div>
+</header>
+<main id="list"><div class="empty">Enter the review key and press Refresh.</div></main>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const list = $("list");
+
+  // The key is kept for this browser tab only, so a reload does not ask again.
+  try {
+    $("key").value = sessionStorage.getItem("reviewKey") || "";
+    $("reviewer").value = localStorage.getItem("reviewer") || "";
+  } catch (e) { /* storage can be blocked; the page still works */ }
+
+  function el(tag, attrs = {}, children = []) {
+    const node = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) {
+      if (k === "class") node.className = v;
+      else node.setAttribute(k, v);
+    }
+    for (const c of [].concat(children)) {
+      node.append(c instanceof Node ? c : document.createTextNode(c ?? ""));
+    }
+    return node;
+  }
+
+  function splitSummary(summary) {
+    // error_summary is "Root cause: ...\nSuggested fix: ..."
+    const text = summary || "";
+    const idx = text.indexOf("\nSuggested fix:");
+    if (idx === -1) return { cause: text, fix: "" };
+    return {
+      cause: text.slice(0, idx).replace(/^Root cause:\s*/, ""),
+      fix: text.slice(idx + 1).replace(/^Suggested fix:\s*/, ""),
+    };
+  }
+
+  // One fetch per job, shared by the log and the proposed-change blocks.
+  const detailCache = new Map();
+  function fetchDetail(id) {
+    if (!detailCache.has(id)) detailCache.set(id, api(`/api/reviews/${id}`));
+    return detailCache.get(id);
+  }
+
+  async function api(path, options = {}) {
+    const key = $("key").value.trim();
+    const response = await fetch(path, {
+      ...options,
+      headers: { "X-API-Key": key, "Content-Type": "application/json", ...(options.headers || {}) },
+    });
+    if (!response.ok) {
+      let detail = response.statusText;
+      try { detail = (await response.json()).detail || detail; } catch (e) {}
+      throw new Error(`${response.status}: ${detail}`);
+    }
+    return response.json();
+  }
+
+  function renderItem(item) {
+    const { cause, fix } = splitSummary(item.error_summary);
+    const status = el("span", { class: `badge status-${item.status}` }, item.status);
+    const note = el("textarea", { placeholder: "Optional note for the record" });
+    const message = el("p", { class: "msg meta" });
+
+    const decide = (action) => async () => {
+      const reviewer = $("reviewer").value.trim();
+      if (!reviewer) { message.textContent = "Enter your name first."; return; }
+      try { localStorage.setItem("reviewer", reviewer); } catch (e) {}
+      buttons.forEach((b) => (b.disabled = true));
+      try {
+        await api(`/api/reviews/${item.id}/${action}`, {
+          method: "POST",
+          body: JSON.stringify({ reviewer, note: note.value.trim() || null }),
+        });
+        await load();
+      } catch (err) {
+        message.textContent = err.message;
+        buttons.forEach((b) => (b.disabled = false));
+      }
+    };
+
+    const approve = el("button", { class: "approve" }, "Approve");
+    const reject = el("button", { class: "reject" }, "Reject");
+    const buttons = [approve, reject];
+    approve.onclick = decide("approve");
+    reject.onclick = decide("reject");
+
+    const openPr = el("button", { class: "approve" }, "Open draft PR");
+    openPr.onclick = async () => {
+      openPr.disabled = true;
+      message.textContent = "Opening draft PR...";
+      try {
+        await api(`/api/reviews/${item.id}/open-pr`, { method: "POST" });
+        await load();
+      } catch (err) {
+        message.textContent = err.message;
+        openPr.disabled = false;
+      }
+    };
+
+    let actions;
+    if (item.status === "PENDING_REVIEW") {
+      actions = [note, el("div", { class: "row" }, [approve, reject]), message];
+    } else {
+      actions = [el("p", { class: "meta" }, `Decided by ${item.reviewed_by || "?"} at ${item.reviewed_at || "?"}${item.review_note ? ` - "${item.review_note}"` : ""}`)];
+    }
+    if (item.pr_url) {
+      actions.push(el("p", {}, [el("a", { href: item.pr_url, target: "_blank", rel: "noopener" }, "View draft PR")]));
+    } else if (item.status === "APPROVED" && item.has_changes) {
+      actions.push(el("div", { class: "row" }, [openPr]), message);
+    }
+
+    // The full log and the proposed file change are loaded only when opened.
+    const lazy = (summary, render) => {
+      const block = el("details", {}, [el("summary", {}, summary), el("pre", {}, "Loading...")]);
+      block.addEventListener("toggle", async () => {
+        if (!block.open || block.dataset.loaded) return;
+        block.dataset.loaded = "1";
+        try {
+          const detail = await fetchDetail(item.id);
+          render(block, detail);
+        } catch (err) {
+          block.querySelector("pre").textContent = err.message;
+        }
+      });
+      return block;
+    };
+    const logBlock = lazy("Log", (block, detail) => {
+      block.querySelector("pre").textContent = detail.raw_log || "(no log stored)";
+    });
+    const changeBlock = lazy("Proposed change", (block, detail) => {
+      block.querySelector("pre").remove();
+      if (!detail.proposed_changes.length) {
+        block.append(el("pre", {}, "No file change was proposed."));
+        return;
+      }
+      for (const change of detail.proposed_changes) {
+        block.append(el("div", { class: "label" }, change.path), el("pre", {}, change.content));
+      }
+    });
+
+    return el("section", { class: "card" }, [
+      el("div", { class: "row" }, [
+        el("strong", {}, `${item.repo_name} - ${item.workflow_name} #${item.run_id}`),
+        status,
+      ]),
+      el("div", { class: "meta" }, `Job: ${item.job_name}  |  Failed step: ${item.failed_step || "unknown"}`),
+      el("div", { class: "meta" }, `Type: ${item.failure_type || "-"}  |  Confidence: ${item.confidence || "-"}`),
+      el("div", { class: "label" }, "Root cause (Gemini)"),
+      el("div", {}, cause || "-"),
+      el("div", { class: "label" }, "Suggested fix"),
+      el("div", {}, fix || "-"),
+      logBlock,
+      ...(item.has_changes ? [changeBlock] : []),
+      ...(item.pr_url
+        ? [el("p", {}, [el("a", { href: item.pr_url, target: "_blank", rel: "noopener" }, "View draft PR on GitHub")])]
+        : []),
+      ...actions,
+    ]);
+  }
+
+  async function load() {
+    try { sessionStorage.setItem("reviewKey", $("key").value.trim()); } catch (e) {}
+    list.replaceChildren(el("div", { class: "empty" }, "Loading..."));
+    try {
+      const items = await api(`/api/reviews?status=${encodeURIComponent($("status").value)}`);
+      if (!items.length) {
+        list.replaceChildren(el("div", { class: "empty" }, "Nothing here yet."));
+        return;
+      }
+      list.replaceChildren(...items.map(renderItem));
+    } catch (err) {
+      list.replaceChildren(el("div", { class: "empty" }, err.message));
+    }
+  }
+
+  $("refresh").onclick = load;
+  $("status").onchange = load;
+  $("key").addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
+</script>
+</body>
+</html>

@@ -46,28 +46,30 @@ class WorkflowFailure(Base):
 
     repository = relationship("Repository")
 
-class WorkflowRun(Base):
-    __tablename__ = "workflow_runs"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    repository_id: Mapped[int] = mapped_column(ForeignKey("repositories.id"), index=True)
-    workflow_name: Mapped[str] = mapped_column(String(255))
-    branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    conclusion: Mapped[str | None] = mapped_column(String(50), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-
-    repository: Mapped["Repository"] = relationship()
-    job_failures: Mapped[list["JobFailure"]] = relationship(back_populates="workflow_run")
-
 class JobFailure(Base):
+    # One row per failed job in a failed workflow run.
     __tablename__ = "job_failures"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    workflow_run_id: Mapped[int] = mapped_column(ForeignKey("workflow_runs.id"), index=True)
+    workflow_failure_id: Mapped[int] = mapped_column(
+        ForeignKey("workflow_failures.id"), index=True
+    )
+    github_job_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    job_name: Mapped[str] = mapped_column(String(255))
+    failed_step: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    raw_log: Mapped[str | None] = mapped_column(Text, nullable=True)
     failure_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # NEW -> LOG_FETCHED -> PENDING_REVIEW, or ERROR with the reason in error_summary.
     status: Mapped[str] = mapped_column(String(50), default="NEW")
     error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     confidence: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    head_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    workflow_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    proposed_changes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pr_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
-    workflow_run: Mapped["WorkflowRun"] = relationship(back_populates="job_failures")
+    workflow_failure: Mapped["WorkflowFailure"] = relationship()
